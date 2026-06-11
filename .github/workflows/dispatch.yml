@@ -8,12 +8,14 @@ name: Exact-time dispatcher
 # All identifying configuration (target repo, workflow files, times) lives in
 # the DISPATCH_CONFIG secret, and log output is kept generic — this repo is
 # public (for unlimited Actions minutes) and run logs are world-readable.
+# Config-derived values must NEVER reach the log: jq/date stderr is discarded
+# and all echoes use generic job indices.
 #
 # Secrets:
 #   DISPATCH_TOKEN  — token with repo+workflow scope on the target repository
 #   DISPATCH_CONFIG — JSON: {"repo":"owner/name","jobs":[{"workflow":"file.yml",
-#                     "sgt":"HH:MM","dow":"Mon"?}, ...]}  (times in Asia/Singapore;
-#                     "dow" optional three-letter day filter)
+#                     "sgt":"HH:MM","dow":"Mon"?}, ...]}  (times in Asia/Singapore,
+#                     two-digit 24h HH:MM; "dow" optional three-letter day filter)
 
 on:
   schedule:
@@ -27,8 +29,10 @@ on:
         type: boolean
         default: true
 
+# Scheduled wakes share one group (backups queue behind the sleeping primary);
+# manual runs get their own group so test_mode really does run NOW.
 concurrency:
-  group: dispatcher
+  group: ${{ github.event_name == 'schedule' && 'dispatcher' || format('dispatcher-manual-{0}', github.run_id) }}
   cancel-in-progress: false
 
 permissions:
@@ -42,20 +46,34 @@ jobs:
       GH_TOKEN: ${{ secrets.DISPATCH_TOKEN }}
       CONFIG: ${{ secrets.DISPATCH_CONFIG }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Wait for each target time and dispatch
         run: |
           set -euo pipefail
           TEST="${{ inputs.test_mode }}"
-          REPO=$(jq -r .repo <<<"$CONFIG")
+          # Parse the config ONCE, guarded: jq errors can echo input fragments,
+          # so stderr is discarded and failures emit only generic messages.
+          REPO=$(jq -er '.repo' <<<"$CONFIG" 2>/dev/null) \
+            || { echo "::error::DISPATCH_CONFIG invalid (.repo) — fix the secret"; exit 1; }
+          echo "REPO=$REPO" >> "$GITHUB_ENV"
+          JOBS=$(jq -r '.jobs | sort_by(.sgt) | .[] | "\(.workflow)|\(.sgt)|\(.dow // "*")"' <<<"$CONFIG" 2>/dev/null) \
+            || { echo "::error::DISPATCH_CONFIG invalid (.jobs) — fix the secret"; exit 1; }
           TODAY=$(TZ=Asia/Singapore date +%F)
           DOW_NOW=$(TZ=Asia/Singapore date +%a)
+
+          # Re-enable target workflows in case GitHub auto-disabled their
+          # fallback schedules (60 days without commits). No-op when enabled;
+          # avoids keep-alive commits that would trigger the target's deploys.
+          while IFS='|' read -r WF AT DOW; do
+            [ -n "$WF" ] || continue
+            gh workflow enable "$WF" -R "$REPO" >/dev/null 2>&1 || true
+          done <<<"$JOBS"
 
           # Count today's (SGT) REAL-SEND runs of a workflow that are queued,
           # in progress, or already succeeded — i.e. "someone is handling it".
           already_handled() {
-            gh run list -R "$REPO" --workflow "$1" --limit 30 \
+            gh run list -R "$REPO" --workflow "$1" --limit 100 \
               --json displayTitle,status,conclusion,createdAt \
               --jq "[ .[]
                       | select(.displayTitle | contains(\"REAL-SEND\"))
@@ -65,9 +83,12 @@ jobs:
           }
 
           i=0
-          jq -r '.jobs | sort_by(.sgt) | .[] | "\(.workflow)|\(.sgt)|\(.dow // "*")"' <<<"$CONFIG" \
-          | while IFS='|' read -r WF AT DOW; do
+          while IFS='|' read -r WF AT DOW; do
+            [ -n "$WF" ] || continue
             i=$((i+1))
+            # validate config-derived values so no other command can echo them
+            case "$WF" in (*[!A-Za-z0-9._-]*|"") echo "job#$i: invalid workflow in config — skipping"; continue;; esac
+            case "$AT" in ([0-1][0-9]:[0-5][0-9]|2[0-3]:[0-5][0-9]) ;; (*) echo "job#$i: invalid time in config — skipping"; continue;; esac
             if [ "$DOW" != "*" ] && [ "$DOW" != "$DOW_NOW" ]; then
               echo "job#$i: not due today"; continue
             fi
@@ -82,13 +103,14 @@ jobs:
             if [ "$(already_handled "$WF")" -gt 0 ]; then
               echo "job#$i: already handled today — skipping"; continue
             fi
-            TARGET=$(TZ=Asia/Singapore date -d "$TODAY $AT:00" +%s)
+            TARGET=$(TZ=Asia/Singapore date -d "$TODAY $AT:00" +%s 2>/dev/null) \
+              || { echo "job#$i: time parse failed — skipping"; continue; }
             NOW=$(date +%s)
-            if [ "$NOW" -gt $((TARGET + 7200)) ]; then
-              echo "job#$i: >2h past target — leaving to the target's fallback cron"; continue
+            if [ "$NOW" -gt $((TARGET + 21600)) ]; then
+              echo "job#$i: >6h past target — leaving to the target's fallback cron"; continue
             fi
             if [ "$NOW" -lt "$TARGET" ]; then
-              echo "job#$i: sleeping $((TARGET - NOW))s until target"
+              echo "job#$i: sleeping until target"
               sleep $((TARGET - NOW))
             fi
             ok=0
@@ -106,29 +128,17 @@ jobs:
               echo "job#$i: run not visible yet — one more dispatch for safety"
               gh workflow run "$WF" -R "$REPO" -f dry_run=false >/dev/null 2>&1 || true
             fi
-          done
+          done <<<"$JOBS"
 
-      - name: Keep-alive commits (reset GitHub's 60-day schedule-disable timer)
+      - name: Keep-alive commit (resets GitHub's 60-day schedule-disable timer)
+        if: ${{ !cancelled() }}
         continue-on-error: true
         run: |
           set -u
-          # own repo
           LAST=$(git log -1 --format=%ct)
           if [ $(( ( $(date +%s) - LAST ) / 86400 )) -ge 45 ]; then
             git config user.name "dispatch-bot"
             git config user.email "actions@users.noreply.github.com"
             git commit --allow-empty -m "keep-alive" >/dev/null
-            git push >/dev/null 2>&1 && echo "own keep-alive pushed"
-          fi
-          # target repo (its scheduled fallbacks also disable after 60 quiet days)
-          gh auth setup-git >/dev/null 2>&1
-          REPO=$(jq -r .repo <<<"$CONFIG")
-          git clone --depth 1 "https://github.com/$REPO.git" /tmp/target >/dev/null 2>&1
-          cd /tmp/target
-          LAST=$(git log -1 --format=%ct)
-          if [ $(( ( $(date +%s) - LAST ) / 86400 )) -ge 45 ]; then
-            git config user.name "dispatch-bot"
-            git config user.email "actions@users.noreply.github.com"
-            git commit --allow-empty -m "chore: keep-alive (GitHub disables scheduled workflows after 60 days without commits)" >/dev/null
-            git push >/dev/null 2>&1 && echo "target keep-alive pushed"
+            git push >/dev/null 2>&1 && echo "keep-alive pushed"
           fi
