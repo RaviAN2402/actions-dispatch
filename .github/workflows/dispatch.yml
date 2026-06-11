@@ -1,0 +1,134 @@
+name: Exact-time dispatcher
+
+# GitHub cron starts scheduled runs late — minutes off-peak, HOURS in the
+# congested 00:00-02:00 UTC window. This job wakes EARLY on staggered crons,
+# sleeps to the exact target second, then fires workflow_dispatch at the
+# configured repository so its run STARTS on time.
+#
+# All identifying configuration (target repo, workflow files, times) lives in
+# the DISPATCH_CONFIG secret, and log output is kept generic — this repo is
+# public (for unlimited Actions minutes) and run logs are world-readable.
+#
+# Secrets:
+#   DISPATCH_TOKEN  — token with repo+workflow scope on the target repository
+#   DISPATCH_CONFIG — JSON: {"repo":"owner/name","jobs":[{"workflow":"file.yml",
+#                     "sgt":"HH:MM","dow":"Mon"?}, ...]}  (times in Asia/Singapore;
+#                     "dow" optional three-letter day filter)
+
+on:
+  schedule:
+    - cron: '37 22 * * *'   # wake 06:37 SGT
+    - cron: '7 23 * * *'    # backup wake 07:07 SGT
+    - cron: '37 23 * * *'   # backup wake 07:37 SGT
+  workflow_dispatch:
+    inputs:
+      test_mode:
+        description: 'Test — dispatch each due target NOW as a dry-run (no waiting, no real send)'
+        type: boolean
+        default: true
+
+concurrency:
+  group: dispatcher
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # keep-alive commits (GitHub disables schedules after 60 days without commits)
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    env:
+      GH_TOKEN: ${{ secrets.DISPATCH_TOKEN }}
+      CONFIG: ${{ secrets.DISPATCH_CONFIG }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Wait for each target time and dispatch
+        run: |
+          set -euo pipefail
+          TEST="${{ inputs.test_mode }}"
+          REPO=$(jq -r .repo <<<"$CONFIG")
+          TODAY=$(TZ=Asia/Singapore date +%F)
+          DOW_NOW=$(TZ=Asia/Singapore date +%a)
+
+          # Count today's (SGT) REAL-SEND runs of a workflow that are queued,
+          # in progress, or already succeeded — i.e. "someone is handling it".
+          already_handled() {
+            gh run list -R "$REPO" --workflow "$1" --limit 30 \
+              --json displayTitle,status,conclusion,createdAt \
+              --jq "[ .[]
+                      | select(.displayTitle | contains(\"REAL-SEND\"))
+                      | select(.status != \"completed\" or .conclusion == \"success\")
+                      | select(((.createdAt | fromdateiso8601) + 28800 | gmtime | strftime(\"%Y-%m-%d\")) == \"$TODAY\")
+                    ] | length" 2>/dev/null || echo 0
+          }
+
+          i=0
+          jq -r '.jobs | sort_by(.sgt) | .[] | "\(.workflow)|\(.sgt)|\(.dow // "*")"' <<<"$CONFIG" \
+          | while IFS='|' read -r WF AT DOW; do
+            i=$((i+1))
+            if [ "$DOW" != "*" ] && [ "$DOW" != "$DOW_NOW" ]; then
+              echo "job#$i: not due today"; continue
+            fi
+            if [ "$TEST" = "true" ]; then
+              if gh workflow run "$WF" -R "$REPO" -f dry_run=true >/dev/null 2>&1; then
+                echo "job#$i: TEST dispatch ok (dry-run)"
+              else
+                echo "job#$i: TEST dispatch FAILED"
+              fi
+              continue
+            fi
+            if [ "$(already_handled "$WF")" -gt 0 ]; then
+              echo "job#$i: already handled today — skipping"; continue
+            fi
+            TARGET=$(TZ=Asia/Singapore date -d "$TODAY $AT:00" +%s)
+            NOW=$(date +%s)
+            if [ "$NOW" -gt $((TARGET + 7200)) ]; then
+              echo "job#$i: >2h past target — leaving to the target's fallback cron"; continue
+            fi
+            if [ "$NOW" -lt "$TARGET" ]; then
+              echo "job#$i: sleeping $((TARGET - NOW))s until target"
+              sleep $((TARGET - NOW))
+            fi
+            ok=0
+            for a in 1 2 3; do
+              if gh workflow run "$WF" -R "$REPO" -f dry_run=false >/dev/null 2>&1; then ok=1; break; fi
+              echo "job#$i: dispatch attempt $a failed; retrying"; sleep 15
+            done
+            if [ "$ok" != "1" ]; then
+              echo "job#$i: ALL dispatch attempts failed — target's fallback cron will cover"; continue
+            fi
+            sleep 25
+            if [ "$(already_handled "$WF")" -gt 0 ]; then
+              echo "job#$i: dispatched and verified started"
+            else
+              echo "job#$i: run not visible yet — one more dispatch for safety"
+              gh workflow run "$WF" -R "$REPO" -f dry_run=false >/dev/null 2>&1 || true
+            fi
+          done
+
+      - name: Keep-alive commits (reset GitHub's 60-day schedule-disable timer)
+        continue-on-error: true
+        run: |
+          set -u
+          # own repo
+          LAST=$(git log -1 --format=%ct)
+          if [ $(( ( $(date +%s) - LAST ) / 86400 )) -ge 45 ]; then
+            git config user.name "dispatch-bot"
+            git config user.email "actions@users.noreply.github.com"
+            git commit --allow-empty -m "keep-alive" >/dev/null
+            git push >/dev/null 2>&1 && echo "own keep-alive pushed"
+          fi
+          # target repo (its scheduled fallbacks also disable after 60 quiet days)
+          gh auth setup-git >/dev/null 2>&1
+          REPO=$(jq -r .repo <<<"$CONFIG")
+          git clone --depth 1 "https://github.com/$REPO.git" /tmp/target >/dev/null 2>&1
+          cd /tmp/target
+          LAST=$(git log -1 --format=%ct)
+          if [ $(( ( $(date +%s) - LAST ) / 86400 )) -ge 45 ]; then
+            git config user.name "dispatch-bot"
+            git config user.email "actions@users.noreply.github.com"
+            git commit --allow-empty -m "chore: keep-alive (GitHub disables scheduled workflows after 60 days without commits)" >/dev/null
+            git push >/dev/null 2>&1 && echo "target keep-alive pushed"
+          fi
