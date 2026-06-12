@@ -17,9 +17,15 @@ name: Exact-time dispatcher
 #                     "sgt":"HH:MM","dow":"Mon"?}, ...]}  (times in Asia/Singapore,
 #                     two-digit 24h HH:MM; "dow" optional three-letter day filter)
 
+# Six staggered wakes: on 2026-06-12 GitHub delayed ALL of 22:37/23:07/23:37
+# by 90-150 min and the first dispatch ran 14 min late — wake much earlier so
+# even multi-hour delays can't miss the first target (sleeping is free here).
 on:
   schedule:
-    - cron: '37 22 * * *'   # wake 06:37 SGT
+    - cron: '37 20 * * *'   # wake 04:37 SGT
+    - cron: '7 21 * * *'    # backup wake 05:07 SGT
+    - cron: '37 21 * * *'   # backup wake 05:37 SGT
+    - cron: '37 22 * * *'   # backup wake 06:37 SGT
     - cron: '7 23 * * *'    # backup wake 07:07 SGT
     - cron: '37 23 * * *'   # backup wake 07:37 SGT
   workflow_dispatch:
